@@ -427,99 +427,17 @@ struct HashMapComparatorDefault<Vector3> {
 	}
 };
 
-constexpr uint32_t HASH_TABLE_SIZE_MAX = 29;
+constexpr uint32_t HASH_TABLE_SIZE_MAX = 31;
 
-inline constexpr uint32_t hash_table_size_primes[HASH_TABLE_SIZE_MAX] = {
-	5,
-	13,
-	23,
-	47,
-	97,
-	193,
-	389,
-	769,
-	1543,
-	3079,
-	6151,
-	12289,
-	24593,
-	49157,
-	98317,
-	196613,
-	393241,
-	786433,
-	1572869,
-	3145739,
-	6291469,
-	12582917,
-	25165843,
-	50331653,
-	100663319,
-	201326611,
-	402653189,
-	805306457,
-	1610612741,
-};
-
-// Computed with elem_i = UINT64_C (0 x FFFFFFFF FFFFFFFF ) / d_i + 1, where d_i is the i-th element of the above array.
-inline constexpr uint64_t hash_table_size_primes_inv[HASH_TABLE_SIZE_MAX] = {
-	3689348814741910324,
-	1418980313362273202,
-	802032351030850071,
-	392483916461905354,
-	190172619316593316,
-	95578984837873325,
-	47420935922132524,
-	23987963684927896,
-	11955116055547344,
-	5991147799191151,
-	2998982941588287,
-	1501077717772769,
-	750081082979285,
-	375261795343686,
-	187625172388393,
-	93822606204624,
-	46909513691883,
-	23456218233098,
-	11728086747027,
-	5864041509391,
-	2932024948977,
-	1466014921160,
-	733007198436,
-	366503839517,
-	183251896093,
-	91625960335,
-	45812983922,
-	22906489714,
-	11453246088
-};
-
-/**
- * Fastmod computes ( n mod d ) given the precomputed c much faster than n % d.
- * The implementation of fastmod is based on the following paper by Daniel Lemire et al.
- * Faster Remainder by Direct Computation: Applications to Compilers and Software Libraries
- * https://arxiv.org/abs/1902.01961
- */
-static _FORCE_INLINE_ uint32_t fastmod(const uint32_t n, const uint64_t c, const uint32_t d) {
+static _FORCE_INLINE_ void prefetch_heap_block(const char *ctrl) {
+	// Prefetch the heap-allocated memory region to resolve potential TLB
+	// misses.  This is intended to overlap with execution of calculating the hash for a key.
 #if defined(_MSC_VER)
-	// Returns the upper 64 bits of the product of two 64-bit unsigned integers.
-	// This intrinsic function is required since MSVC does not support unsigned 128-bit integers.
 #if defined(_M_X64) || defined(_M_ARM64)
-	return __umulh(c * n, d);
-#else
-	// Fallback to the slower method for 32-bit platforms.
-	return n % d;
+	_mm_prefetch((const char *)ctrl, _MM_HINT_T0);
 #endif // _M_X64 || _M_ARM64
 #else
-#ifdef __SIZEOF_INT128__
-	// Prevent compiler warning, because we know what we are doing.
-	uint64_t lowbits = c * n;
-	__extension__ typedef unsigned __int128 uint128;
-	return static_cast<uint64_t>(((uint128)lowbits * d) >> 64);
-#else
-	// Fallback to the slower method if no 128-bit unsigned integer type is available.
-	return n % d;
-#endif // __SIZEOF_INT128__
+	__builtin_prefetch(static_cast<const void *>(ctrl));
 #endif // _MSC_VER
 }
 

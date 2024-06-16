@@ -53,16 +53,21 @@ class HashSet {
 public:
 	static constexpr uint32_t MIN_CAPACITY_INDEX = 2; // Use a prime.
 	static constexpr float MAX_OCCUPANCY = 0.75;
-	static constexpr uint32_t EMPTY_HASH = 0;
+	static constexpr uint32_t EMPTY_HASH = 0 - 1u;
+	static constexpr uint32_t EAD = 2;
 
 private:
+	struct Index {
+		uint32_t next;
+		uint32_t slot;
+	};
+
 	TKey *keys = nullptr;
-	uint32_t *hash_to_key = nullptr;
-	uint32_t *key_to_hash = nullptr;
-	uint32_t *hashes = nullptr;
+	Index *index = nullptr;
 
 	uint32_t capacity_index = 0;
 	uint32_t num_elements = 0;
+	uint32_t last_pos = 0;
 
 	_FORCE_INLINE_ uint32_t _hash(const TKey &p_key) const {
 		uint32_t hash = Hasher::hash(p_key);
@@ -74,130 +79,291 @@ private:
 		return hash;
 	}
 
-	static _FORCE_INLINE_ uint32_t _get_probe_length(const uint32_t p_pos, const uint32_t p_hash, const uint32_t p_capacity, const uint64_t p_capacity_inv) {
-		const uint32_t original_pos = fastmod(p_hash, p_capacity_inv, p_capacity);
-		return fastmod(p_pos - original_pos + p_capacity, p_capacity_inv, p_capacity);
-	}
-
 	bool _lookup_pos(const TKey &p_key, uint32_t &r_pos) const {
 		if (keys == nullptr || num_elements == 0) {
 			return false; // Failed lookups, no elements
 		}
 
-		const uint32_t capacity = hash_table_size_primes[capacity_index];
-		const uint64_t capacity_inv = hash_table_size_primes_inv[capacity_index];
 		uint32_t hash = _hash(p_key);
-		uint32_t pos = fastmod(hash, capacity_inv, capacity);
-		uint32_t distance = 0;
+		uint32_t mask = (1 << capacity_index) - 1;
+		uint32_t bucket = hash & mask;
+		uint32_t next_bucket = index[bucket].next;
+
+		if (next_bucket == EMPTY_HASH) {
+			return false;
+		}
 
 		while (true) {
-			if (hashes[pos] == EMPTY_HASH) {
-				return false;
-			}
-
-			if (distance > _get_probe_length(pos, hashes[pos], capacity, capacity_inv)) {
-				return false;
-			}
-
-			if (hashes[pos] == hash && Comparator::compare(keys[hash_to_key[pos]], p_key)) {
-				r_pos = hash_to_key[pos];
+			uint32_t pos = index[bucket].slot & mask;
+			if (((index[bucket].slot & ~mask) == (hash & ~mask)) && Comparator::compare(keys[pos], p_key)) {
+				r_pos = pos;
 				return true;
 			}
+			if (next_bucket == bucket) {
+				return false;
+			}
+			bucket = next_bucket;
+			next_bucket = index[bucket].next;
+		}
+		return false;
+	}
 
-			pos = fastmod(pos + 1, capacity_inv, capacity);
-			distance++;
+	/*
+	  Different probing techniques usually provide a trade-off between memory locality and avoidance of clustering.
+	  Since Robin Hood hashing is relatively resilient to clustering (both primary and secondary), linear probing is the most cache friendly alternativeis typically used.
+
+	  It's the core algorithm of this hash map with highly optimization/benchmark.
+	  normaly linear probing is inefficient with high load factor, it use a new 3-way linear
+	  probing strategy to search empty slot. from benchmark even the load factor > 0.9, it's more 2-3 timer fast than
+	  one-way search strategy.
+
+	  1. linear or quadratic probing a few cache line for less cache miss from input slot "bucket_from".
+	  2. the first  search  slot from member variant "_last", init with 0
+	  3. the second search slot from calculated pos "(_num_filled + _last) & _mask", it's like a rand value
+	  */
+	// key is not in this mavalue. Find a place to put it.
+	uint32_t _find_empty_bucket(const uint32_t p_bucket_from) {
+		const uint32_t mask = (1 << capacity_index) - 1;
+		uint32_t bucket = p_bucket_from;
+		if ((index[++bucket].next == EMPTY_HASH) || (index[++bucket].next == EMPTY_HASH)) {
+			return bucket;
+		}
+
+		uint32_t offset = 2u;
+		constexpr uint32_t linear_probe_length = 6u;
+		for (; offset < linear_probe_length; offset += 2) {
+			uint32_t bucket1 = (bucket + offset) & mask;
+			if ((index[bucket1].next == EMPTY_HASH) || (index[++bucket1].next == EMPTY_HASH))
+				return bucket1;
+		}
+		for (uint32_t slot = bucket + offset;; slot++) {
+			uint32_t bucket1 = slot++ & _mask;
+			if (unlikely(index[bucket1].next == EMPTY_HASH))
+				return bucket1;
+
+			uint32_t medium = (num_elements + _last++) & mask;
+			if ((index[medium].next == EMPTY_HASH) || (index[++medium].next == EMPTY_HASH)) {
+				return medium;
+			}
+			++_last &= mask;
+		}
+		return 0;
+	}
+
+	uint32_t _find_prev_bucket(const uint32_t p_main_bucket, const uint32_t p_bucket) const {
+		uint32_t next_bucket = index[p_main_bucket].next;
+		if (next_bucket == p_bucket)
+			return p_main_bucket;
+
+		while (true) {
+			const uint32_t nbucket = index[next_bucket].next;
+			if (nbucket == p_bucket)
+				return next_bucket;
+			next_bucket = nbucket;
 		}
 	}
 
-	uint32_t _insert_with_hash(uint32_t p_hash, uint32_t p_index) {
-		const uint32_t capacity = hash_table_size_primes[capacity_index];
-		const uint64_t capacity_inv = hash_table_size_primes_inv[capacity_index];
-		uint32_t hash = p_hash;
-		uint32_t index = p_index;
-		uint32_t distance = 0;
-		uint32_t pos = fastmod(hash, capacity_inv, capacity);
+	// kick out bucket and find empty to occpuy
+	// it will break the orgin link and relink again.
+	// before: main_bucket-->prev_bucket --> bucket   --> next_bucket
+	// after : main_bucket-->prev_bucket --> (removed)--> new_bucket--> next_bucket
+	uint32_t _kickout_bucket(const uint32_t p_kmain, const uint32_t p_bucket) {
+		const uint32_t next_bucket = index[p_bucket].next;
+		const uint32_t new_bucket = _find_empty_bucket(next_bucket);
+		const uint32_t prev_bucket = _find_prev_bucket(p_kmain, p_bucket);
+
+		const uint32_t last_bucket = next_bucket == p_bucket ? new_bucket : next_bucket;
+		index[new_bucket] = { last_bucket, index[p_bucket].slot };
+
+		index[prev_bucket].next = new_bucket;
+		index[p_bucket].next = EMPTY_HASH;
+
+		return p_bucket;
+	}
+
+	uint32_t _find_last_bucket(uint32_t p_main_bucket) const {
+		uint32_t next_bucket = index[p_main_bucket].next;
+		if (next_bucket == p_main_bucket)
+			return p_main_bucket;
 
 		while (true) {
-			if (hashes[pos] == EMPTY_HASH) {
-				hashes[pos] = hash;
-				key_to_hash[index] = pos;
-				hash_to_key[pos] = index;
-				return pos;
-			}
-
-			// Not an empty slot, let's check the probing length of the existing one.
-			uint32_t existing_probe_len = _get_probe_length(pos, hashes[pos], capacity, capacity_inv);
-			if (existing_probe_len < distance) {
-				key_to_hash[index] = pos;
-				SWAP(hash, hashes[pos]);
-				SWAP(index, hash_to_key[pos]);
-				distance = existing_probe_len;
-			}
-
-			pos = fastmod(pos + 1, capacity_inv, capacity);
-			distance++;
+			const uint32_t nbucket = index[next_bucket].next;
+			if (nbucket == next_bucket)
+				return next_bucket;
+			next_bucket = nbucket;
 		}
+	}
+
+	uint32_t _find_unique_bucket(uint32_t p_hash) {
+		const uint32_t mask = (1 << capacity_index) - 1;
+		uint32_t bucket = p_hash & mask;
+		uint32_t next_bucket = index[bucket].next;
+		if (next_bucket == EMPTY_HASH) {
+			return bucket;
+		}
+
+		//check current bucket_key is in main bucket or not
+		const uint32_t pos = index[bucket].slot & mask;
+		const uint32_t kmain = _hash(elements[pos].data.key) & mask;
+		if (unlikely(kmain != bucket)) {
+			return _kickout_bucket(kmain, bucket);
+		} else if (unlikely(next_bucket != bucket)) {
+			next_bucket = _find_last_bucket(next_bucket);
+		}
+		return index[next_bucket].next = _find_empty_bucket(next_bucket);
+	}
+
+	uint32_t _insert_with_hash(uint32_t p_hash, TKey &p_key) {
+		const uint32_t mask = (1 << capacity_index) - 1;
+		uint32_t hash = p_hash;
+		uint32_t bucket = _find_unique_bucket(hash);
+		keys[num_elements] = p_key;
+		etail = bucket;
+		index[bucket] = { bucket, num_elements++ | (hash & mask) };
 	}
 
 	void _resize_and_rehash(uint32_t p_new_capacity_index) {
+		uint32_t old_capacity = 1 << capacity_index;
+		uint32_t old_mask = old_capacity - 1;
+
 		// Capacity can't be 0.
 		capacity_index = MAX((uint32_t)MIN_CAPACITY_INDEX, p_new_capacity_index);
 
-		uint32_t capacity = hash_table_size_primes[capacity_index];
+		uint32_t capacity = 1 << capacity_index;
 
-		uint32_t *old_hashes = hashes;
-		uint32_t *old_key_to_hash = key_to_hash;
+		TKey *old_keys = keys;
+		Index *old_hashes = index;
 
-		hashes = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
-		keys = reinterpret_cast<TKey *>(Memory::realloc_static(keys, sizeof(TKey) * capacity));
-		key_to_hash = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
-		hash_to_key = reinterpret_cast<uint32_t *>(Memory::realloc_static(hash_to_key, sizeof(uint32_t) * capacity));
+		num_elements = 0;
+		index = reinterpret_cast<Index *>(Memory::alloc_static(sizeof(Index) * (capacity + EAD)));
+		keys = reinterpret_cast<TKey *>(Memory::alloc_static(sizeof(TKey) * capacity));
 
-		for (uint32_t i = 0; i < capacity; i++) {
-			hashes[i] = EMPTY_HASH;
+		memset(index, EMPTY_HASH, sizeof(Index) * capacity);
+		memset(index + capacity, 0, sizeof(Index) * EAD);
+		memset(keys, 0, sizeof(TKey) * capacity);
+
+		if (old_capacity == 0) {
+			// Nothing to do.
+			return;
 		}
 
-		for (uint32_t i = 0; i < num_elements; i++) {
-			uint32_t h = old_hashes[old_key_to_hash[i]];
-			_insert_with_hash(h, i);
-		}
-
+		memcpy((char *)keys, (char *)old_keys, num_elements * sizeof(TKey));
+		Memory::free_static(old_keys);
 		Memory::free_static(old_hashes);
-		Memory::free_static(old_key_to_hash);
+
+		etail = EMPTY_HASH;
+		last_pos = 0;
+		uint32_t mask = capacity - 1;
+		for (uint32_t pos = 0; pos < num_elements; ++pos) {
+			const TKey &key = elements[pos].data.key;
+			const uint32_t hash = _hash(key);
+			const uint32_t bucket = _find_unique_bucket(hash);
+			index[bucket] = { bucket, pos | (hash & ~mask) };
+		}
 	}
 
 	_FORCE_INLINE_ int32_t _insert(const TKey &p_key) {
-		uint32_t capacity = hash_table_size_primes[capacity_index];
+		uint32_t capacity = 1 << capacity_index;
 		if (unlikely(keys == nullptr)) {
 			// Allocate on demand to save memory.
 
-			hashes = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
+			index = reinterpret_cast<Index *>(Memory::alloc_static(sizeof(Index) * (capacity + EAD)));
 			keys = reinterpret_cast<TKey *>(Memory::alloc_static(sizeof(TKey) * capacity));
-			key_to_hash = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
-			hash_to_key = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
 
-			for (uint32_t i = 0; i < capacity; i++) {
-				hashes[i] = EMPTY_HASH;
-			}
+			memset(index, EMPTY_HASH, sizeof(Index) * capacity);
+			memset(index + capacity, 0, sizeof(Index) * EAD);
+			memset(keys, 0, sizeof(TKey) * capacity);
 		}
 
 		uint32_t pos = 0;
 		bool exists = _lookup_pos(p_key, pos);
 
 		if (exists) {
-			return pos;
+			elements[pos].data.value = p_value;
+			return &elements[pos];
 		} else {
 			if (num_elements + 1 > MAX_OCCUPANCY * capacity) {
-				ERR_FAIL_COND_V_MSG(capacity_index + 1 == HASH_TABLE_SIZE_MAX, -1, "Hash table maximum capacity reached, aborting insertion.");
+				ERR_FAIL_COND_V_MSG(capacity_index + 1 == HASH_TABLE_SIZE_MAX, nullptr, "Hash table maximum capacity reached, aborting insertion.");
 				_resize_and_rehash(capacity_index + 1);
 			}
 
 			uint32_t hash = _hash(p_key);
-			memnew_placement(&keys[num_elements], TKey(p_key));
-			_insert_with_hash(hash, num_elements);
-			num_elements++;
-			return num_elements - 1;
+			_insert_with_hash(hash, p_key);
+			return &keys[num_elements - 1];
 		}
+	}
+
+	uint32_t _lookup_bucket(const TKey &p_key, const uint32_t p_hash) {
+		uint32_t mask = (1 << capacity_index) - 1;
+		uint32_t bucket = p_hash & mask;
+		uint32_t next_bucket = index[bucket].next;
+		uint32_t pos = 0;
+
+		if (next_bucket == EMPTY_HASH) {
+			return EMPTY_HASH;
+		}
+
+		while (true) {
+			pos = index[bucket].slot & mask;
+			if (((index[bucket].slot & ~mask) == (p_hash & ~mask)) && Comparator::compare(elements[pos].data.key, p_key)) {
+				return bucket;
+			}
+			if (next_bucket == bucket) {
+				return EMPTY_HASH;
+			}
+			bucket = next_bucket;
+			next_bucket = index[bucket].next;
+		}
+	}
+
+	// Find the slot with this key, or return bucket size
+	uint32_t _pos_to_bucket(const uint32_t p_pos) const {
+		const uint32_t mask = (1 << capacity_index) - 1;
+		const uint32_t key_hash = _hash(elements[p_pos].data.key);
+		uint32_t bucket = key_hash & mask;
+		while (true) {
+			if (likely(p_pos == (index[bucket].slot & mask))) {
+				return bucket;
+			}
+			bucket = index[bucket].next;
+		}
+		return EMPTY_HASH;
+	}
+
+	uint32_t _erase_bucket(const uint32_t p_bucket, const uint32_t p_main_bucket) {
+		const uint32_t next_bucket = index[p_bucket].next;
+		if (p_bucket == p_main_bucket) {
+			if (p_main_bucket != next_bucket) {
+				const uint32_t nbucket = index[next_bucket].next;
+				index[p_main_bucket] = {
+					(nbucket == next_bucket) ? p_main_bucket : nbucket,
+					index[next_bucket].slot
+				};
+			}
+			return next_bucket;
+		}
+
+		const uint32_t prev_bucket = _find_prev_bucket(p_main_bucket, p_bucket);
+		index[prev_bucket].next = (p_bucket == next_bucket) ? prev_bucket : next_bucket;
+		return p_bucket;
+	}
+
+	void _erase_slot(const uint32_t sbucket, const uint32_t main_bucket) {
+		const uint32_t mask = (1 << capacity_index) - 1;
+		const uint32_t pos = index[sbucket].slot & mask;
+		const uint32_t ebucket = _erase_bucket(sbucket, main_bucket);
+		const uint32_t last = --num_elements;
+		if (likely(pos != last)) {
+			const uint32_t last_bucket = (etail == EMPTY_HASH || ebucket == etail)
+					? _pos_to_bucket(last)
+					: etail;
+			CRASH_COND_MSG(last_bucket == EMPTY_HASH, "HashMap data corrupted.");
+			new(&elements[pos]) HashMapElement<TKey, TValue>(elements[last].data.key, elements[last].data.value);
+			index[last_bucket].slot = pos | (index[last_bucket].slot & ~mask);
+		}
+
+		etail = EMPTY_HASH;
+		index[ebucket] = { EMPTY_HASH, 0 };
 	}
 
 	void _init_from(const HashSet &p_other) {
@@ -208,26 +374,20 @@ private:
 			return;
 		}
 
-		uint32_t capacity = hash_table_size_primes[capacity_index];
+		uint32_t capacity = 1 << capacity_index;
 
-		hashes = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
+		index = reinterpret_cast<Index *>(Memory::alloc_static(sizeof(uint32_t) * (capacity + EAD)));
 		keys = reinterpret_cast<TKey *>(Memory::alloc_static(sizeof(TKey) * capacity));
-		key_to_hash = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
-		hash_to_key = reinterpret_cast<uint32_t *>(Memory::alloc_static(sizeof(uint32_t) * capacity));
 
 		for (uint32_t i = 0; i < num_elements; i++) {
 			memnew_placement(&keys[i], TKey(p_other.keys[i]));
-			key_to_hash[i] = p_other.key_to_hash[i];
 		}
 
-		for (uint32_t i = 0; i < capacity; i++) {
-			hashes[i] = p_other.hashes[i];
-			hash_to_key[i] = p_other.hash_to_key[i];
-		}
+		memcpy(index, p_other.index, (capacity + EAD) * sizeof(Index));
 	}
 
 public:
-	_FORCE_INLINE_ uint32_t get_capacity() const { return hash_table_size_primes[capacity_index]; }
+	_FORCE_INLINE_ uint32_t get_capacity() const { return 1 << capacity_index; }
 	_FORCE_INLINE_ uint32_t size() const { return num_elements; }
 
 	/* Standard Godot Container API */
@@ -240,13 +400,12 @@ public:
 		if (keys == nullptr || num_elements == 0) {
 			return;
 		}
-		uint32_t capacity = hash_table_size_primes[capacity_index];
-		for (uint32_t i = 0; i < capacity; i++) {
-			hashes[i] = EMPTY_HASH;
-		}
+		uint32_t capacity = 1 << capacity_index;
+		memset((char *)index, EMPTY_HASH, sizeof(Index) * num_elements);
+
 		for (uint32_t i = 0; i < num_elements; i++) {
 			keys[i].~TKey();
-		}
+	}
 
 		num_elements = 0;
 	}
@@ -262,7 +421,7 @@ public:
 
 		if (!exists) {
 			return false;
-		}
+	}
 
 		uint32_t key_pos = pos;
 		pos = key_to_hash[pos]; //make hash pos
@@ -270,18 +429,18 @@ public:
 		const uint32_t capacity = hash_table_size_primes[capacity_index];
 		const uint64_t capacity_inv = hash_table_size_primes_inv[capacity_index];
 		uint32_t next_pos = fastmod(pos + 1, capacity_inv, capacity);
-		while (hashes[next_pos] != EMPTY_HASH && _get_probe_length(next_pos, hashes[next_pos], capacity, capacity_inv) != 0) {
+		while (index[next_pos] != EMPTY_HASH && _get_probe_length(next_pos, index[next_pos], capacity, capacity_inv) != 0) {
 			uint32_t kpos = hash_to_key[pos];
 			uint32_t kpos_next = hash_to_key[next_pos];
 			SWAP(key_to_hash[kpos], key_to_hash[kpos_next]);
-			SWAP(hashes[next_pos], hashes[pos]);
+			SWAP(index[next_pos], index[pos]);
 			SWAP(hash_to_key[next_pos], hash_to_key[pos]);
 
 			pos = next_pos;
 			next_pos = fastmod(pos + 1, capacity_inv, capacity);
-		}
+	}
 
-		hashes[pos] = EMPTY_HASH;
+		index[pos] = EMPTY_HASH;
 		keys[key_pos].~TKey();
 		num_elements--;
 		if (key_pos < num_elements) {
@@ -300,7 +459,7 @@ public:
 	void reserve(uint32_t p_new_capacity) {
 		uint32_t new_index = capacity_index;
 
-		while (hash_table_size_primes[new_index] < p_new_capacity) {
+		while ((1 << capacity_index) < p_new_capacity) {
 			ERR_FAIL_COND_MSG(new_index + 1 == (uint32_t)HASH_TABLE_SIZE_MAX, nullptr);
 			new_index++;
 		}
@@ -419,18 +578,15 @@ public:
 		if (this == &p_other) {
 			return; // Ignore self assignment.
 		}
-
-		clear();
+		if (num_elements != 0) {
+			clear();
+		}
 
 		if (keys != nullptr) {
 			Memory::free_static(keys);
-			Memory::free_static(key_to_hash);
-			Memory::free_static(hash_to_key);
-			Memory::free_static(hashes);
+			Memory::free_static(index);
 			keys = nullptr;
-			hashes = nullptr;
-			hash_to_key = nullptr;
-			key_to_hash = nullptr;
+			index = nullptr;
 		}
 
 		_init_from(p_other);
@@ -450,13 +606,9 @@ public:
 
 		if (keys != nullptr) {
 			Memory::free_static(keys);
-			Memory::free_static(key_to_hash);
-			Memory::free_static(hash_to_key);
-			Memory::free_static(hashes);
+			Memory::free_static(index);
 			keys = nullptr;
-			hashes = nullptr;
-			hash_to_key = nullptr;
-			key_to_hash = nullptr;
+			index = nullptr;
 		}
 		capacity_index = MIN_CAPACITY_INDEX;
 	}
@@ -466,9 +618,7 @@ public:
 
 		if (keys != nullptr) {
 			Memory::free_static(keys);
-			Memory::free_static(key_to_hash);
-			Memory::free_static(hash_to_key);
-			Memory::free_static(hashes);
+			Memory::free_static(index);
 		}
 	}
 };

@@ -135,15 +135,13 @@ private:
 			TaskID,
 			Task *,
 			HashMapHasherDefault,
-			HashMapComparatorDefault<TaskID>,
-			PagedAllocator<HashMapElement<TaskID, Task *>, false, TASKS_PAGE_SIZE>>
+			HashMapComparatorDefault<TaskID>>
 			tasks;
 	HashMap<
 			GroupID,
 			Group *,
 			HashMapHasherDefault,
-			HashMapComparatorDefault<GroupID>,
-			PagedAllocator<HashMapElement<GroupID, Group *>, false, GROUPS_PAGE_SIZE>>
+			HashMapComparatorDefault<GroupID>>
 			groups;
 
 	uint32_t max_low_priority_threads = 0;
